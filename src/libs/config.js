@@ -1,5 +1,6 @@
 const EventEmitter = require('events');
 const fs = require('fs');
+const path = require('path');
 const toml = require('toml');
 const _ = require('lodash');
 
@@ -9,6 +10,7 @@ module.exports = class Config extends EventEmitter {
     constructor(filePath) {
         super();
         this.filePath = filePath;
+        this.baseDir = path.resolve(path.dirname(filePath));
         this.c = {};
     }
 
@@ -22,10 +24,22 @@ module.exports = class Config extends EventEmitter {
     }
 
     get(key, def) {
-        let val = _.get(this.c, key);
-        return typeof val === 'undefined' ?
-            def :
-            val;
+        let val = process.env[key.toUpperCase()];
+        if (typeof val !== 'undefined') {
+            // If the value looks to be a JSON structure, parse it
+            if (val[0] === '[' || val[0] === '{' || val[0] === '"') {
+                val = JSON.parse(val);
+            }
+
+            return val;
+        }
+
+        val = _.get(this.c, key);
+        if (typeof val !== 'undefined') {
+            return val;
+        }
+
+        return def;
     }
 
     static instance(...args) {

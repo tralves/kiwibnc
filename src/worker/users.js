@@ -1,5 +1,6 @@
-const bcrypt = require('bcrypt');
 const uuidv4 = require('uuid/v4');
+const bcrypt = require('bcrypt');
+const Helpers = require('../libs/helpers');
 
 class Users {
     constructor(db) {
@@ -7,62 +8,71 @@ class Users {
     }
 
     async authUserNetwork(username, password, network) {
-        let row = null;
+        let ret = { network: null, user: null };
+
+        if (!Helpers.validUsername(username)) {
+            return ret;
+        }
+
         try {
-            row = await this.db.get(`
+            let row = await this.db.get(`
                 SELECT
                     nets.*,
                     users.password as _pass,
                     users.admin as user_admin
                 FROM user_networks nets
                 INNER JOIN users ON users.id = nets.user_id
-                WHERE users.username = ? AND nets.name = ?
+                WHERE users.username LIKE ? AND nets.name LIKE ?
             `, [username, network]);
             
             if (row) {
                 let correctHash = await bcrypt.compare(password, row._pass);
-                if (!correctHash) {
-                    row = null;
-                } else {
-                    // We don't need the password hash going anywhere else, get rid of it
+                if (correctHash) {
+                    ret.user = { admin: row.user_admin };
                     delete row._pass;
+                    delete row.user_admin;
+
+                    ret.network = this.db.factories.Network.fromDbResult(row);
                 }
             }
         } catch (err) {
             l.error('Error logging user in:', err.stack);
         }
 
-        return row;
+        return ret;
     }
 
     async authUser(username, password) {
-        let row = await this.db.get(`SELECT * from users WHERE username = ?`, [username]);
-        if (row) {
-            let correctHash = await bcrypt.compare(password, row.password);
-            if (!correctHash) {
-                row = null;
-            } else {
-                // We don't need the password hash going anywhere else, get rid of it
-                delete row.password;
-            }
+        if (!Helpers.validUsername(username)) {
+            return null;
         }
-        return row;
+
+        let user = await this.db.get(`SELECT * from users WHERE username LIKE ?`, [username])
+            .then(this.db.factories.User.fromDbResult);
+
+        if (user && await user.checkPassword(password)) {
+            return user;
+        }
+
+        return null;
     }
 
     async authUserToken(token) {
-        let row = await this.db.get(`SELECT * from user_tokens WHERE token = ?`, [token]);
-        if (!row) {
-            return;
+        let sql = `
+            SELECT
+                users.*
+            FROM users
+            INNER JOIN user_tokens ON users.id = user_tokens.user_id
+            WHERE user_tokens.token = ?
+        `;
+        let user = await this.db.get(sql, [token])
+            .then(this.db.factories.User.fromDbResult);
+
+        if (user) {
+            return user;
         }
 
-        let user = await this.db.get(`SELECT * from users WHERE id = ?`, [row.user_id]);
-        if (!user) {
-            return;
-        }
-
-        // We don't need the password hash going anywhere else, get rid of it
-        delete user.password;
-        return user;
+        return null;
     }
 
     async generateUserToken(id) {
@@ -76,42 +86,56 @@ class Users {
     }
 
     async getUser(username) {
-        return await this.db.get(`SELECT * from users WHERE username = ?`, [username]);
+        if (!Helpers.validUsername(username)) {
+            return null;
+        }
+
+        return this.db.factories.User.query().where('username', 'LIKE', username).first();
     }
 
-    async addUser(username, password) {
-        await this.db.db('users').insert({
-            username,
-            password: await bcrypt.hash(password, 8),
-            created_at: Date.now()
-        });
+    async addUser(username, password, isAdmin) {
+        if (!Helpers.validUsername(username)) {
+            throw new Error('Invalid username');
+        }
 
-        return await this.getUser(username);
+        let user = this.db.factories.User();
+        user.username = username;
+        user.password = password;
+        user.created_at = Date.now();
+        if (isAdmin === true) {
+            user.admin = true;
+        }
+        await user.save();
+
+        return user;
     };
 
     async changeUserPassword(id, password) {
-        await this.db.run('UPDATE users SET password = ? WHERE id = ?', [
-            await bcrypt.hash(password, 8),
-            id,
-        ]);
+        let user = await this.db.factories.User.query().where('id', id);
+        if (!user) {
+            return;
+        }
+
+        user.password = password;
+        return user.save();
     };
 
     async getUserNetworks(userId) {
-        let rows = await this.db.all('SELECT * FROM user_networks WHERE user_id = ?', [userId]);
-        return rows;
+        return this.db.factories.Network.query()
+            .where('user_id', userId);
     }
 
     async getNetwork(id) {
-        let row = await this.db.get(`SELECT * from user_networks WHERE id = ?`, [id]);
-        return row;
+        return this.db.factories.Network.query()
+            .where('id', id)
+            .first();
     }
 
     async getNetworkByName(userId, netName) {
-        let row = await this.db.get(`SELECT * from user_networks WHERE user_id = ? AND name = ?`, [
-            userId,
-            netName,
-        ]);
-        return row;
+        return this.db.factories.Network.query()
+            .where('user_id', userId)
+            .where('name', 'LIKE', netName)
+            .first();
     }
 }
 

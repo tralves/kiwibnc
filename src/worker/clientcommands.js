@@ -1,4 +1,4 @@
-const { ircLineParser } = require('irc-framework');
+const { ircLineParser, Message } = require('irc-framework');
 const { mParam, mParamU } = require('../libs/helpers');
 const ClientControl = require('./clientcontrol');
 const hooks = require('./hooks');
@@ -71,18 +71,30 @@ async function maybeProcessRegistration(con) {
         return;
     }
 
-    // Matching for user/network:pass or user:pass
-    let m = regState.pass.match(/([^\/:]+)(?:\/([^:]+))?(?::(.*))?/);
-    if (!m) {
+    // get bnc username and password
+    let username = '';
+    let networkName = '';
+    let password = '';
+    let network = null;
+
+    let m = regState.pass.match(/([^\/:]+)(?:\/([^:]*))?(?::(.*))?/);
+    let mu = regState.user.match(/([^\/]+)(?:\/(.+))?/);
+    if (m && regState.pass.includes(':')) {
+        // PASS user/network:pass or user/:pass or user:pass
+        username = m[1] || '';
+        networkName = m[2] || '';
+        password = m[3] || '';
+    } else if (mu && regState.pass) {
+        // PASS pass
+        // USER user/network or user
+        username = mu[1] || '';
+        networkName = mu[2] || '';
+        password = regState.pass || '';
+    } else {
         await con.writeMsg('ERROR', 'Invalid password');
         con.close();
         return false;
     }
-
-    let username = m[1] || '';
-    let networkName = m[2] || '';
-    let password = m[3] || '';
-    let network = null;
 
     let hook = await hooks.emit('auth', {username, networkName, password, client: con, userId: null, network: null, isAdmin: false});
     if (hook.prevent) {
@@ -97,25 +109,36 @@ async function maybeProcessRegistration(con) {
         if (hook.event.network) {
             con.state.authNetworkId = hook.event.network.id;
             network = hook.event.network;
+        } else if (networkName) {
+            // Extension authed the user but left the network to us
+            network = await con.userDb.getNetworkByName(hook.event.userId, networkName);
+            if (network) {
+                con.state.authNetworkId = network.id;
+            }
         }
+
+    } else if (con.state.authUserId && con.state.authNetworkId) {
+        // User has already logged in to a network
+        network = await con.userDb.getNetwork(con.state.authNetworkId);
 
     } else if (networkName) {
         // Logging into a network
-        network = await con.userDb.authUserNetwork(username, password, networkName);
-        if (!network) {
+        let auth = await con.userDb.authUserNetwork(username, password, networkName);
+        if (!auth.network) {
             await con.writeMsg('ERROR', 'Invalid password');
             con.close();
             return false;
         }
 
+        network = auth.network;
         con.state.authUserId = network.user_id;
         con.state.authNetworkId = network.id;
-        con.state.authAdmin = !!network.user_admin;
+        con.state.authAdmin = auth.user && !!auth.user.admin;
     } else {
         // Logging into a user only mode (no attached network)
         let user = await con.userDb.authUser(username, password);
         if (!user) {
-            con.writeMsg('ERROR', 'Invalid password');
+            await con.writeMsg('ERROR', 'Invalid password');
             con.close();
             return false;
         }
@@ -134,14 +157,14 @@ async function maybeProcessRegistration(con) {
     if (network) {
         if (!con.upstream) {
             con.makeUpstream(network);
-            con.writeStatus('Connecting to the network..');
+            con.writeStatus('Connecting to the network...');
         } else if (!con.upstream.state.connected) {
             // The upstream connection will call con.registerClient() once it's registered
-            con.writeStatus('Connecting to the network..');
+            con.writeStatus('Waiting for the network to connect...');
             con.upstream.open();
         } else {
             con.writeStatus(`Attaching you to the network`);
-            if (con.upstream.state.netRegistered) {
+            if (con.upstream.state.receivedMotd) {
                 await con.registerClient();
             }
         }
@@ -159,25 +182,31 @@ async function maybeProcessRegistration(con) {
  */
 
 commands.CAP = async function(msg, con) {
-    let availableCaps = [];
+    let availableCaps = new Set();
     await hooks.emit('available_caps', {client: con, caps: availableCaps});
 
     if (mParamU(msg, 0, '') === 'LIST') {
-        con.writeMsg('CAP', '*', 'LIST', con.state.caps.join(' '));
+        con.writeFromBnc('CAP', '*', 'LIST', Array.from(con.state.caps).join(' '));
     }
 
     if (mParamU(msg, 0, '') === 'LS') {
         // Record the version of CAP the client is using
-        await con.state.tempSet('capping', mParamU(msg, 1, '301'));
-        con.writeMsg('CAP', '*', 'LS', availableCaps.join(' '));
+        let currentVer = con.state.tempGet('capver') || 301;
+        let newVer = parseInt(mParamU(msg, 1, '301'), 10);
+        if (!isNaN(newVer) && newVer > currentVer) {
+            await con.state.tempSet('capver', newVer);
+        }
+
+        await con.state.tempSet('capping', true);
+        con.writeFromBnc('CAP', '*', 'LS', Array.from(availableCaps).join(' '));
     }
 
     if (mParamU(msg, 0, '') === 'REQ') {
         let requested = mParam(msg, 1, '').split(' ');
-        let matched = requested.filter((cap) => availableCaps.includes(cap));
-        con.state.caps = con.state.caps.concat(matched);
+        let matched = requested.filter((cap) => availableCaps.has(cap));
+        con.state.caps = new Set([...con.state.caps, ...matched]);
         await con.state.save();
-        con.writeMsg('CAP', '*', 'ACK', matched.join(' '));
+        con.writeFromBnc('CAP', '*', 'ACK', matched.join(' '));
     }
 
     if (mParamU(msg, 0, '') === 'END') {
@@ -215,7 +244,10 @@ commands.USER = async function(msg, con) {
 commands.NOTICE = async function(msg, con) {
     // Send this message to other connected clients
     con.upstream && con.upstream.forEachClient((client) => {
-        client.writeMsgFrom(con.upstream.state.nick, 'NOTICE', msg.params[0], msg.params[1]);
+        let m = new Message('NOTICE', msg.params[0], msg.params[1]);
+        m.prefix = con.upstream.state.nick;
+        m.source = 'client';
+        client.writeMsg(m);
     }, con);
 
     if (con.upstream && con.upstream.state.logging) {
@@ -231,7 +263,10 @@ commands.NOTICE = async function(msg, con) {
 commands.PRIVMSG = async function(msg, con) {
     // Send this message to other connected clients
     con.upstream && con.upstream.forEachClient((client) => {
-        client.writeMsgFrom(con.upstream.state.nick, 'PRIVMSG', msg.params[0], msg.params[1]);
+        let m = new Message('PRIVMSG', msg.params[0], msg.params[1]);
+        m.prefix = con.upstream.state.nick;
+        m.source = 'client';
+        client.writeMsg(m);
     }, con);
 
     // PM to *bnc while logged in
@@ -292,17 +327,6 @@ commands.PING = async function(msg, con) {
 commands.QUIT = async function(msg, con) {
     // Some clients send a QUIT when they close, don't send that upstream
     con.close();
-    return false;
-};
-
-// TODO: Put these below commands behind a login or something
-commands.KILL = async function(msg, con) {
-    con.queue.stopListening().then(process.exit);
-    return false;
-};
-
-commands.RELOAD = async function(msg, con) {
-    con.reloadClientCommands();
     return false;
 };
 

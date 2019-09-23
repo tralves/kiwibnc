@@ -12,6 +12,10 @@ module.exports.run = async function(msg, con) {
     let command = input.substr(0, pos).toUpperCase();
     input = input.substr(pos + 1);
 
+    if (command === '') {
+        command = 'HELP';
+    }
+
     if (typeof commands[command] === 'object') {
         let cmd = commands[command];
         if (cmd.requiresNetworkAuth && !con.state.authNetworkId) {
@@ -30,8 +34,16 @@ module.exports.run = async function(msg, con) {
         await commands[command](input, con, msg);
 
     } else {
-        con.writeStatus('Invalid command');
+        con.writeStatus(`Invalid command (${command})`);
     }
+};
+
+commands.HELP = {
+    requiresNetworkAuth: false,
+    fn: async function(input, con, msg) {
+        con.writeStatus(`Here are the supported commands:`);
+        con.writeStatus(Object.keys(commands).sort().join(' '));
+    },
 };
 
 commands.HELLO =
@@ -86,8 +98,66 @@ commands.LISTNETWORKS = async function(input, con, msg) {
     let nets = await con.userDb.getUserNetworks(con.state.authUserId);
     con.writeStatus(`${nets.length} network(s)`)
     nets.forEach((net) => {
-        con.writeStatus(`Network: ${net.name} ${net.nick} ${net.host}:${net.tls?'+':''}${net.port}`);
+        let netCon = con.conDict.findUsersOutgoingConnection(
+            con.state.authUserId,
+            con.state.authNetworkId,
+        );
+        let activeNick = netCon ?
+            netCon.state.nick :
+            net.nick;
+        let connected = netCon && netCon.state.connected ?
+            'Yes' :
+            'No';
+        let info = [
+            `Network: ${net.name} (${net.host}:${net.tls?'+':''}${net.port})`,
+            `Active nick: ${activeNick}`,
+            `Connected? ${connected}`,
+        ];
+        con.writeStatus(info.join('. '));
     });
+};
+
+commands.ATTACH = async function(input, con, msg) {
+    // attach network_name
+
+    let parts = input.split(' ');
+    if (!input || parts.length === 0) {
+        con.writeStatus('Usage: attach <network_name>');
+        return;
+    }
+
+    if (con.state.authNetworkId) {
+        con.writeStatus('Already attached to a netork');
+        return;
+    }
+
+    let netName = parts[0];
+
+    // Make sure the network exists
+    let network = await con.userDb.getNetworkByName(con.state.authUserId, netName);
+    if (!network) {
+        con.writeStatus(`Network ${netName} could not be found`);
+        return;
+    }
+
+    con.state.authNetworkId = network.id;
+    con.cachedUpstreamId = false;
+
+    // Close any active upstream connections we have for this network
+    let upstream = await con.conDict.findUsersOutgoingConnection(con.state.authUserId, network.id);
+    if (upstream && !upstream.state.connected) {
+        // The upstream connection will call con.registerClient() once it's registered
+        con.writeStatus('Connecting to the network..');
+        upstream.open();
+    } else if (upstream) {
+        con.writeStatus(`Attaching you to the network`);
+        if (upstream.state.receivedMotd) {
+            await con.registerClient();
+        }
+    } else {
+        con.makeUpstream(network);
+        con.writeStatus('Connecting to the network..');
+    }
 };
 
 commands.CHANGENETWORK = {
@@ -111,6 +181,9 @@ commands.CHANGENETWORK = {
             real: 'realname',
             password: 'password',
             pass: 'password',
+            account: 'sasl_account',
+            account_pass: 'sasl_pass',
+            account_password: 'sasl_pass',
         };
 
         input.split(' ').forEach(part => {
@@ -154,15 +227,16 @@ commands.CHANGENETWORK = {
         });
 
         if (Object.keys(toUpdate).length > 0) {
-            await con.db.db('user_networks')
-                .where('user_id', con.state.authUserId)
-                .where('id', con.state.authNetworkId)
-                .update(toUpdate);
+            let network = await con.userDb.getNetwork(con.state.authNetworkId);
+            for (let prop in toUpdate) {
+                network[prop] = toUpdate[prop];
+            }
+            await network.save();
             
             con.writeStatus(`Updated network`);
         } else {
             con.writeStatus(`Usage: changenetwork server=irc.example.net port=6697 tls=yes`);
-            con.writeStatus(`Available fields: name, server, port, tls, nick, username, realname, password`);
+            con.writeStatus(`Available fields: name, server, port, tls, nick, username, realname, password, account, account_password`);
         }
     },
 };
@@ -193,6 +267,9 @@ commands.ADDNETWORK = {
             real: 'realname',
             password: 'password',
             pass: 'password',
+            account: 'sasl_account',
+            account_pass: 'sasl_pass',
+            account_password: 'sasl_pass',
         };
 
         input.split(' ').forEach(part => {
@@ -257,8 +334,13 @@ commands.ADDNETWORK = {
             return;
         }
 
-        toUpdate.user_id = con.state.authUserId;
-        await con.db.db('user_networks').insert(toUpdate);
+        let network = await con.db.factories.Network();
+        network.user_id = con.state.authUserId;
+        for (let prop in toUpdate) {
+            network[prop] = toUpdate[prop];
+        }
+        await network.save();
+
         con.writeStatus(`New network saved. You can now login using your_username/${toUpdate.name}:your_password`);
     },
 };
@@ -319,7 +401,7 @@ commands.ADDUSER = {
         let username = parts[0] || '';
         let password = parts[1] || '';
         if (!username || !password) {
-            con.writeStatus('Usage: adduwer <username> <password>');
+            con.writeStatus('Usage: adduser <username> <password>');
             return false;
         }
 
@@ -353,4 +435,20 @@ commands.STATUS = async function(input, con, msg) {
         con.writeStatus('This ID: ' + con.id);
         con.writeStatus('Upstream ID: ' + con.upstream.id);
     }
+};
+
+commands.KILL = {
+    requiresAdmin: true,
+    fn: async function(input, con, msg) {
+        con.queue.stopListening().then(process.exit);
+        return false;
+    },
+};
+
+commands.RELOAD = {
+    requiresAdmin: true,
+    fn: async function(input, con, msg) {
+        con.reloadClientCommands();
+        return false;
+    },
 };

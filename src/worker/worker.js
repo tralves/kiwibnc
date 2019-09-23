@@ -1,6 +1,8 @@
+const path = require('path');
 const uuidv4 = require('uuid/v4');
 const { ircLineParser } = require('irc-framework');
 const Database = require('../libs/database');
+const Crypt = require('../libs/crypt');
 const Users = require('./users');
 const MessageStore = require('./messagestores/sqlite');
 const ConnectionOutgoing = require('./connectionoutgoing');
@@ -9,12 +11,22 @@ const ConnectionDict = require('./connectiondict');
 const hooks = require('./hooks');
 
 async function run() {
-    let app = await require('../libs/bootstrap')('worker');
+    let app = await require('../libs/bootstrap')('worker', {type: 'worker'});
+
+    let cryptKey = app.conf.get('database.crypt_key', '');
+    if (cryptKey.length !== 32) {
+        console.error('Cannot start: config option database.crypt_key must be 32 characters long');
+        process.exit();
+    }
+    app.crypt = new Crypt(cryptKey);
 
     app.db = new Database(app.conf.get('database.path', './connections.db'));
     await app.db.init();
 
+    initModelFactories(app);
+
     app.userDb = new Users(app.db);
+    app.db.users = app.userDb;
 
     app.messages = new MessageStore(app.conf.get('messages', {}));
     await app.messages.init();
@@ -23,6 +35,7 @@ async function run() {
     app.cons = new ConnectionDict(app.db, app.userDb, app.messages, app.queue);
 
     initExtensions(app);
+    broadcastStats(app);
     listenToQueue(app);
 
     // Give some time for the queue to connect + sync up
@@ -36,7 +49,12 @@ async function initExtensions(app) {
     let extensions = app.conf.get('extensions.loaded') || [];
     extensions.forEach(async extName => {
         try {
-            let ext = require(`./extensions/${extName}/`);
+            let extPath = (extName[0] === '.' || extName[0] === '/') ?
+                path.join(app.conf.baseDir, extName) :
+                `./extensions/${extName}/`;
+
+            l.info('Loading extension ' + extPath);
+            let ext = require(extPath);
             await ext.init(hooks, app);
         } catch (err) {
             l.error('Error loading extension ' + extName + ': ', err.stack);
@@ -48,23 +66,46 @@ async function initExtensions(app) {
     hooks.addBuiltInHooks();
 };
 
+function initModelFactories(app) {
+    app.db.factories.Network = require('../libs/dataModels/network').factory(app.db, app.crypt);
+    app.db.factories.User = require('../libs/dataModels/user').factory(app.db);
+}
+
+function broadcastStats(app) {
+    function broadcast() {
+        app.stats.gauge('stats.connections', app.cons.map.size);
+
+        let mem = process.memoryUsage();
+        app.stats.gauge('stats.memoryheapused', mem.heapUsed);
+        app.stats.gauge('stats.memoryheaptotal', mem.heapTotal);
+        app.stats.gauge('stats.memoryrss', mem.rss);
+
+        setTimeout(broadcast, 10000);
+    }
+
+    broadcast();
+}
+
 function listenToQueue(app) {
     let cons = app.cons;
-    app.queue.listenForEvents(app.queue.queueToWorker);
+    app.queue.listenForEvents();
 
     app.queue.on('reset', async (event) => {
         // Wipe out all incoming connection states. Incoming connections need to manually reconnect
         await app.db.run('DELETE FROM connections WHERE type = ?', [ConnectionDict.TYPE_INCOMING]);
+
+        // Since there are now no incoming connections, clear all incoming<>outgoing links
         await app.db.run('UPDATE connections SET linked_con_ids = "[]"');
 
-        // If we don't have any connections then we don't need to clear anything out. We do
+        // If we don't have any connections then we have nothing to clear out. We do
         // need to start our servers again though
         if (cons.size === 0) {
             startServers(app);
             return;
         }
 
-        // Give some time for the queue to process some internal stuff
+        // Give some time for the queue to process some internal stuff then just exit. This worker
+        // will get restarted by the sockets process automatically
         app.queue.stopListening().then(async () => {
             setTimeout(() => {
                 process.exit();
@@ -95,7 +136,7 @@ function listenToQueue(app) {
     app.queue.on('connection.open', async (event) => {
         let con = cons.get(event.id);
         if (con) {
-            con.onUpstreamConnected();
+            await con.onUpstreamConnected();
         }
     });
     app.queue.on('connection.close', async (event) => {
@@ -133,8 +174,8 @@ function listenToQueue(app) {
     });
 }
 
-// Start any listening servers on interfaces specified in the config, or any existing
-// servers that were previously started outside of the config
+// Start any listening servers on interfaces specified in the config if they do not
+// exist as an active connection already
 async function startServers(app) {
     let existingBinds = await app.db.all('SELECT host, port FROM connections WHERE type = ?', [
         ConnectionDict.TYPE_LISTENING
@@ -178,7 +219,6 @@ async function loadConnections(app) {
                 port: row.port,
                 id: row.conid,
             });
-            return;
         }
     });
 }

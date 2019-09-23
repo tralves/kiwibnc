@@ -7,6 +7,7 @@ class IrcBuffer {
         this.isChannel = upstreamCon ?
             upstreamCon.isChannelName(name) :
             true;
+        this.lastSeen = 0;
     }
 
     static fromObj(obj) {
@@ -31,15 +32,17 @@ class ConnectionState {
         this.serverPrefix = 'bnc';
         this.registrationLines = [];
         this.isupports = [];
-        this.caps = [];
+        this.caps = new Set();
         this.buffers = Object.create(null);
         this.nick = 'unknown-user';
+        this.account = '';
         this.username = 'user';
         this.realname = 'BNC user';
         this.password = '';
         this.host = '';
         this.port = 6667;
         this.tls = false;
+        this.bindHost = '';
         this.type = 0; // 0 = outgoing, 1 = incoming, 2 = server
         this.connected = false;
         this.sasl = {
@@ -48,6 +51,8 @@ class ConnectionState {
         };
         // netRegistered - incomingcon = client authed+registered, outgoingcon = regged to the upstream irc network
         this.netRegistered = false;
+        // receivedMotd - outgoingcon = received MOTD end or error from upstream
+        this.receivedMotd = false;
         this.authUserId = 0;
         this.authNetworkId = 0;
         this.authAdmin = false;
@@ -72,18 +77,21 @@ class ConnectionState {
         let query = this.db.db('connections').insert({
             conid: this.conId,
             last_statesave: Date.now(),
+            bind_host: '',
             host: this.host,
             port: this.port,
             tls: this.tls,
             type: this.type,
+            account: this.account,
             connected: this.connected,
             sasl: JSON.stringify(this.sasl),
             server_prefix: this.serverPrefix,
             registration_lines: JSON.stringify(this.registrationLines),
             isupports: JSON.stringify(this.isupports),
-            caps: JSON.stringify(this.caps),
+            caps: JSON.stringify(Array.from(this.caps)),
             buffers: JSON.stringify(this.buffers),
             nick: this.nick,
+            received_motd: this.receivedMotd,
             net_registered: this.netRegistered,
             auth_user_id: this.authUserId,
             auth_network_id: this.authNetworkId,
@@ -96,6 +104,37 @@ class ConnectionState {
         await this.db.run(sql);
     }
 
+    async loadConnectionInfo() {
+        let net = await this.db.users.getNetwork(this.authNetworkId);
+        let bindHost = '';
+
+        // If a network doesn't have a bindHost, check if it's user has a global one instead
+        if (net && net.bind_host) {
+            bindHost = net.bind_host;
+        } else if (net && !net.bind_host) {
+            let user = await this.db.factories.User.query().where('id', this.authUserId).first();
+            if (user && user.bind_host) {
+                bindHost = user.bind_host;
+            }
+        }
+
+        if (net) {
+            this.bindHost = bindHost || '';
+            this.host = net.host;
+            this.port = net.port;
+            this.tls = !!net.tls;
+            this.sasl = { account: net.sasl_account || '', password: net.sasl_pass || '' };
+            this.nick = net.nick;
+        } else {
+            // This network wasn't found in the database. Maybe it was deleted
+            this.bindHost = '';
+            this.host = '';
+            this.port = 0;
+            this.tls = false;
+            this.sasl = { account: '', password: '' };
+            this.nick = '';
+        }
+    }
     async load() {
         let sql = `SELECT * FROM connections WHERE conid = ? LIMIT 1`;
         let row = await this.db.get(sql, [this.conId]);
@@ -103,11 +142,12 @@ class ConnectionState {
         if (!row) {
             this.registrationLines = [];
             this.isupports = [];
-            this.caps = [];
+            this.caps = new Set();
             this.buffers = [];
             this.tempData = {};
             this.logging = true;
         } else {
+            this.bindHost = row.bind_host || '';
             this.host = row.host;
             this.port = row.port;
             this.tls = row.tls;
@@ -117,13 +157,15 @@ class ConnectionState {
             this.serverPrefix = row.server_prefix;
             this.registrationLines = JSON.parse(row.registration_lines);
             this.isupports = JSON.parse(row.isupports);
-            this.caps = JSON.parse(row.caps);
+            this.caps = new Set(JSON.parse(row.caps));
             this.buffers = Object.create(null);
             let rowChans = JSON.parse(row.buffers);
             for (let chanName in rowChans) {
                 this.addBuffer(rowChans[chanName]);
             }
             this.nick = row.nick;
+            this.account = row.account;
+            this.receivedMotd = row.received_motd;
             this.netRegistered = row.net_registered;
             this.authUserId = row.auth_user_id;
             this.authNetworkId = row.auth_network_id;

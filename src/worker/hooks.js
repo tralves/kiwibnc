@@ -11,14 +11,15 @@ module.exports = commandHooks;
 commandHooks.addBuiltInHooks = function addBuiltInHooks() {
     // Some caps to always request
     commandHooks.on('available_caps', event => {
-        event.caps.push('batch');
+        event.caps.add('batch');
+        event.caps.add('cap-notify');
     });
 
     // server-time support
     commandHooks.on('message_to_client', event => {
         let caps = event.client.state.caps;
 
-        if (caps.includes('server-time')) {
+        if (caps.has('server-time')) {
             if (!event.message.tags['time']) {
                 event.message.tags['time'] = isoTime();
             }
@@ -27,37 +28,37 @@ commandHooks.addBuiltInHooks = function addBuiltInHooks() {
         }
     });
     commandHooks.on('available_caps', event => {
-        let caps = event.caps.push('server-time');
+        let caps = event.caps.add('server-time');
     });
 
     // away-notify support
     commandHooks.on('message_to_client', event => {
-        if (!event.client.state.caps.includes('away-notify') && event.message.command === 'AWAY') {
+        if (!event.client.state.caps.has('away-notify') && event.message.command === 'AWAY') {
             event.preventDefault();
         }
     });
     commandHooks.on('available_caps', event => {
-        event.caps.push('away-notify');
+        event.caps.add('away-notify');
     });
 
     // account-notify support
     commandHooks.on('message_to_client', event => {
-        if (!event.client.state.caps.includes('account-notify') && event.message.command === 'ACCOUNT') {
+        if (!event.client.state.caps.has('account-notify') && event.message.command === 'ACCOUNT') {
             event.preventDefault();
         }
     });
     commandHooks.on('available_caps', event => {
-        event.caps.push('account-notify');
+        event.caps.add('account-notify');
     });
 
     // account-tag support
     commandHooks.on('message_to_client', event => {
-        if (!event.client.state.caps.includes('account-tag') && event.message.tags['account']) {
+        if (!event.client.state.caps.has('account-tag') && event.message.tags['account']) {
             delete event.message.tags['account'];
         }
     });
     commandHooks.on('available_caps', event => {
-        event.caps.push('account-tag');
+        event.caps.add('account-tag');
     });
 
     // extended-join support
@@ -68,23 +69,50 @@ commandHooks.addBuiltInHooks = function addBuiltInHooks() {
 
         // Only allow the client to use extended-join if upstream has it
         let upstream = event.client.upstream;
-        if (upstream.state.caps.includes('extended-join')) {
-            event.caps.push('extended-join');
+        if (upstream.state.caps.has('extended-join')) {
+            event.caps.add('extended-join');
         }
     });
     commandHooks.on('message_to_client', event => {
         // :nick!user@host JOIN #channelname * :Real Name
         let caps = event.client.state.caps;
         let m = event.message;
-        if (!caps.includes('extended-join') && m.command === 'JOIN' && m.params.length > 2) {
+        if (!caps.has('extended-join') && m.command === 'JOIN' && m.params.length > 2) {
             // Drop the account name from the params (The * in the above example)
             m.params.splice(1, 1);
         }
     });
 
+    // message-tags (and msgid, c2ctags, etc) support
+    commandHooks.on('available_caps', event => {
+        event.caps.add('message-tags');
+    });
+    commandHooks.on('message_to_client', event => {
+        let m = event.message;
+        if (!event.client.state.caps.has('message-tags')) {
+            if (m.command === 'TAGMSG') {
+                event.preventDefault();
+                return;
+            }
+
+            let initialTags = Object.keys(m.tags);
+            for (let i = 0; i < initialTags.length; i++) {
+                let key = initialTags[i];
+                if (key.startsWith('+') && m.tags[key]) {
+                    delete m.tags[key];
+                } else if (key.toLowerCase() == 'msgid' && m.tags[key]) {
+                    delete m.tags[key];
+                }
+                //TODO: move all the specific tag-blocking done by other handlers
+                //  into this one or something similar, since message-tags allows
+                //  any c2c or regular tag
+            }
+        }
+    });
+
     // multi-prefix support
     commandHooks.on('available_caps', event => {
-        event.caps.push('multi-prefix');
+        event.caps.add('multi-prefix');
     });
     commandHooks.on('message_to_client', event => {
         let m = event.message;
@@ -99,7 +127,7 @@ commandHooks.addBuiltInHooks = function addBuiltInHooks() {
 
         let clientCaps = event.client.state.caps;
         let upstreamCaps = event.client.upstream.state.caps;
-        if (!clientCaps.includes('multi-prefix') && upstreamCaps.includes('multi-prefix')) {
+        if (!clientCaps.has('multi-prefix') && upstreamCaps.has('multi-prefix')) {
             // Make sure only one prefix is included in the message before sending them to the client
 
             let prefixes = event.client.upstream.state.isupports.find(token => {
@@ -147,13 +175,13 @@ commandHooks.addBuiltInHooks = function addBuiltInHooks() {
 
     // userhost-in-names support
     commandHooks.on('available_caps', event => {
-        event.caps.push('userhost-in-names');
+        event.caps.add('userhost-in-names');
     });
     commandHooks.on('message_to_client', event => {
         // :server.com 353 guest = #tethys :~&@%+aji &@Attila @+alyx +KindOne Argure
         let caps = event.client.state.caps;
         let m = event.message;
-        if (m.command === '353' && !caps.includes('userhost-in-names')) {
+        if (m.command === '353' && !caps.has('userhost-in-names')) {
             let prefixes = event.client.upstream.state.isupports.find(token => {
                 return token.indexOf('PREFIX=') === 0;
             });

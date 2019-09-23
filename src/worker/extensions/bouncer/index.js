@@ -1,23 +1,23 @@
 const messageTags = require('irc-framework/src/messagetags');
-const { mParam, mParamU } = require('../../../libs/helpers');
+const { mParam, mParamU, isoTime } = require('../../../libs/helpers');
 
-module.exports.init = async function init(hooks) {
+module.exports.init = async function init(hooks, app) {
     let sendConnectionState = async (upstream, state) => {
-        let network = await upstream.state.db.db('user_networks')
-            .where('id', upstream.state.authNetworkId)
-            .where('user_id', upstream.state.authUserId)
-            .first();
-
+        let network = await app.userDb.getNetwork(upstream.state.authNetworkId);
         if (!network) {
             return;
         }
 
         upstream.forEachClient(client => {
-            // TODO: When moved to a CAP, enable this check below
-            // if (client.state.caps.includes('BOUNCER')) {
-            client.writeMsg('BOUNCER', 'state', network.name, state);
+            if (client.state.caps.has('bouncer')) {
+                client.writeMsg('BOUNCER', 'state', network.name, state);
+            }
         });
     };
+
+    hooks.on('available_caps', event => {
+        event.caps.add('bouncer');
+    });
 
     hooks.on('connection_open', event => {
         if (event.upstream) {
@@ -36,14 +36,17 @@ module.exports.init = async function init(hooks) {
         }
     });
 
-    hooks.on('message_to_client', event => {
-        if (event.message.command === '001') {
-            setTimeout(() => {
-                // TODO: This timeout is ugly. Find a way to only send this once when it detects
-                //       a 005 message
-                event.client.writeFromBnc('005', event.client.state.nick, 'BOUNCER');
-            }, 1);
+    hooks.on('available_isupports', async event => {
+        let token = 'BOUNCER';
+        let upstream = event.client.upstream;
+        if (upstream) {
+            let network = await event.client.userDb.getNetwork(upstream.state.authNetworkId);
+            if (network) {
+                token += `=network=${network.name};`;
+            }
         }
+
+        event.tokens.push(token);
     });
 };
 
@@ -95,6 +98,11 @@ async function handleBouncerCommand(event) {
         let upstream = null;
         upstream = con.conDict.findUsersOutgoingConnection(con.state.authUserId, network.id);
         if (upstream && upstream.state.connected) {
+            let quitMessage = mParam(msg, 2, '');
+            if (quitMessage) {
+                upstream.writeLine('QUIT', quitMessage);
+            }
+
             upstream.close();
         }
     }
@@ -114,6 +122,7 @@ async function handleBouncerCommand(event) {
                 parts.push('nick=' + netCon.state.nick);
                 parts.push('state=' + (netCon.state.connected ? 'connected' : 'disconnected'));
             } else {
+                parts.push('nick=' + net.nick);
                 parts.push('state=disconnect');
             }
 
@@ -145,6 +154,9 @@ async function handleBouncerCommand(event) {
                     network: network.name,
                     buffer: buffer.name,
                 };
+                if (buffer.lastSeen) {
+                    chan.seen = isoTime(new Date(buffer.lastSeen));
+                }
                 if (buffer.isChannel) {
                     chan = {
                         ...chan,
@@ -186,6 +198,7 @@ async function handleBouncerCommand(event) {
         if (!buffer) {
             // No buffer? No need to delete anything
             con.writeMsg('BOUNCER', 'delbuffer', network.name, bufferName, 'RPL_OK');
+            return;
         }
 
         upstream.state.delBuffer(buffer.name);
@@ -357,5 +370,27 @@ async function handleBouncerCommand(event) {
         }
 
         con.writeMsg('BOUNCER', 'changenetwork', netName, 'RPL_OK');
+    }
+
+    if (subCmd === 'DELNETWORK') {
+        let netName = mParam(msg, 1);
+
+        // Make sure the network exists
+        let network = await con.userDb.getNetworkByName(con.state.authUserId, netName);
+        if (!network) {
+            con.writeMsg('BOUNCER', 'delnetwork', netName, 'ERR_NETNOTFOUND');
+            return;
+        }
+
+        // Close any active upstream connections we have for this network
+        let upstream = await con.conDict.findUsersOutgoingConnection(con.state.authUserId, network.id);
+        if (upstream) {
+            upstream.close();
+            upstream.destroy();
+        }
+
+
+        await con.db.db('user_networks').where('id', network.id).delete();
+        con.writeMsg('BOUNCER', 'delnetwork', netName, 'RPL_OK');
     }
 };

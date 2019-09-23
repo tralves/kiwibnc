@@ -59,6 +59,7 @@ class ConnectionIncoming {
 
         // If we found an upstream, add this incoming connection to it
         if (upstream) {
+            this.cachedUpstreamId = upstream.id;
             upstream.state.linkIncomingConnection(this.id);
         }
 
@@ -101,10 +102,13 @@ class ConnectionIncoming {
             msgObj = msg;
         }
 
-        return hooks.emit('message_to_client', {client: this, message: msgObj}).then(hook => {
-            if (!hook.prevent) {
-                this.write(msgObj.to1459() + '\r\n');
+        return hooks.emit('message_to_client', {client: this, message: msgObj, raw: ''}).then(hook => {
+            if (hook.prevent) {
+                return;
             }
+
+            let toWrite = hook.event.raw || msgObj.to1459() + '\r\n';
+            this.write(toWrite);
         });
     }
 
@@ -114,29 +118,57 @@ class ConnectionIncoming {
         return this.writeMsg(m);
     }
 
+    supportsCapNotify() {
+        if (this.state.caps.has('cap-notify')) {
+            return true;
+        }
+
+        // CAP versions over 301 implicitally support cap-notify
+        if ((this.state.tempGet('capver') || 301) > 301) {
+            return true;
+        }
+
+        return false;
+    }
+
     async registerLocalClient() {
         let regLines = [
             ['001', this.state.nick, 'Welcome to your BNC'],
             ['002', this.state.nick, 'Your host is *bnc, running version kiwibnc-0.1'],
-            [
-                '005',
-                this.state.nick,
-                'CHANTYPES=#',
-                'CHANMODES=eIbq,k,flj,CFLMPQScgimnprstz',
-                'CHANLIMIT=#:0',
-                'PREFIX=(ov)@+',
-                'MAXLIST=bqeI:100',
-                'MODES=4',
-                'NETWORK=bnc',
-                'CALLERID=g',
-                'CASEMAPPING=rfc1459',
-                'are supported by this server',
-            ],
+        ];
+
+        let isupportTokens = [
+            'CHANTYPES=#',
+            'CHANMODES=eIbq,k,flj,CFLMPQScgimnprstz',
+            'CHANLIMIT=#:0',
+            'PREFIX=(o)@',
+            'MAXLIST=bqeI:100',
+            'MODES=4',
+            'NETWORK=bnc',
+            'CALLERID=g',
+            'CASEMAPPING=rfc1459',
+        ];
+        await hooks.emit('available_isupports', {client: this, tokens: isupportTokens});
+
+        // Convert all the isupport tokens into 005 lines making sure not to go over 512 in length
+        let tokenLines = batchIsupportTokensToMaxLenth(
+            isupportTokens,
+            `:*bnc 005 ${this.state.nick}`,
+            'is supported by this server',
+            512
+        );
+
+        tokenLines.forEach((tokenParams) => {
+            let params = [...tokenParams, 'is supported by this server'];
+            regLines.push(['005', this.state.nick, ...params]);
+        });
+
+        regLines = regLines.concat([
             ['375', this.state.nick, '- BNC Message of the Day -'],
             ['372', this.state.nick, '- Send a message to *bnc to get started -'],
             ['372', this.state.nick, '- /query *bnc -'],
             ['376', this.state.nick, 'End of /MOTD command'],
-        ];
+        ]);
 
         regLines.forEach(line => this.writeFromBnc(...line));
 
@@ -151,17 +183,71 @@ class ConnectionIncoming {
         this.state.realname = upstream.state.realname;
 
         let nick = this.state.nick;
+
+        // Let plugins modify/add isupport tokens
+        let isupports = upstream.state.registrationLines.filter((regLine) => regLine[0] === '005');
+        let isupportTokens = isupports.reduce((prev, cur) => {
+            // Remove the last token as it's usually 'is supported by this server'.
+            let tokens = cur[1];
+            return prev.concat(tokens.slice(0, tokens.length - 1));
+        }, []);
+        await hooks.emit('available_isupports', {client: this, tokens: isupportTokens});
+
+        // Convert all the isupport tokens into 005 lines making sure not to go over 512 in length
+        let tokenLines = batchIsupportTokensToMaxLenth(
+            isupportTokens,
+            `:${upstream.state.serverPrefix} 005 ${nick}`,
+            'is supported by this server',
+            512
+        );
+
+        let sent005 = false;
         upstream.state.registrationLines.forEach((regLine) => {
-            this.writeMsgFrom(upstream.state.serverPrefix, regLine[0], nick, ...regLine[1]);
+            if (regLine[0] === '005' && !sent005) {
+                sent005 = true;
+                tokenLines.forEach((tokenParams) => {
+                    let params = [...tokenParams, 'is supported by this server'];
+                    this.writeMsgFrom(upstream.state.serverPrefix, '005', nick, ...params);
+                });
+            } else if (regLine[0] === '005' && sent005) {
+                return;
+            } else {
+                this.writeMsgFrom(upstream.state.serverPrefix, regLine[0], nick, ...regLine[1]);
+            }
         });
 
+        let account = upstream.state.account;
+        let username = this.state.username;
+        let host = this.state.host;
+        if (account !== '') {
+            this.writeMsgFrom(upstream.state.serverPrefix, '900', nick, `${nick}!${username}@${host}`, account, `You are now logged in as ${account}`);
+        }
+
         this.state.netRegistered = true;
+
+        // If the client supports BOUNCER commands, it will request a buffer list
+        // itself and then request messages as needed
+        if (!this.state.caps.has('bouncer')) {
+            await this.dumpChannels();
+        }
+
+        // If we previously set them away, now bring them back
+        if (await upstream.state.tempGet('set_away')) {
+            upstream.writeLine('AWAY');
+            await upstream.state.tempSet('set_away', null);
+        }
+
+        await this.state.save();
+    }
+
+    async dumpChannels() {
+        let upstream = this.upstream;
 
         // Dump all our joined channels..
         for (let chanName in upstream.state.buffers) {
             let channel = upstream.state.buffers[chanName];
             if (channel.isChannel && channel.joined) {
-                await this.writeMsgFrom(nick, 'JOIN', channel.name);
+                await this.writeMsgFrom(this.state.nick, 'JOIN', channel.name);
                 channel.topic && await this.writeMsg('TOPIC', channel.name, channel.topic);
                 upstream.write(`NAMES ${channel.name}\n`);
             }
@@ -170,7 +256,7 @@ class ConnectionIncoming {
         // Now the client has a channel list, send any messages we have for them
         for (let buffName in upstream.state.buffers) {
             let buffer = upstream.state.buffers[buffName];
-            if (buffer.isChannel && !buffer.joined) {
+            if (!buffer.isChannel || !buffer.joined) {
                 continue;
             }
 
@@ -181,7 +267,7 @@ class ConnectionIncoming {
                 Date.now() - 3600*1000
             );
 
-            let supportsTime = this.state.caps.includes('server-time');
+            let supportsTime = this.state.caps.has('server-time');
             messages.forEach(async (msg) => {
                 if (!supportsTime) {
                     msg.params[1] = `[${strftime('%H:%M:%S')}] ${msg.params[1]}`;
@@ -189,14 +275,6 @@ class ConnectionIncoming {
                 await this.writeMsg(msg);
             });
         }
-
-        // If we previously set them away, now bring them back
-        if (await upstream.state.tempGet('set_away')) {
-            upstream.writeLine('AWAY');
-            await upstream.state.tempSet('set_away', null);
-        }
-
-        await this.state.save();
     }
 
     // Handy helper to reach the hotReloadClientCommands() function
@@ -214,7 +292,7 @@ class ConnectionIncoming {
 
     async makeUpstream(network) {
         // May not be logged into a network
-        if (!this.state.authNetworkId) {
+        if (!this.state.authNetworkId && !network) {
             return null;
         }
 
@@ -228,9 +306,9 @@ class ConnectionIncoming {
         con.state.host = network.host;
         con.state.port = network.port;
         con.state.tls = network.tls;
-        con.state.nick = network.nick;
-        con.state.username = network.username;
-        con.state.realname = network.realname;
+        con.state.nick = network.nick || 'kiwibnc';
+        con.state.username = network.username || 'kiwibnc';
+        con.state.realname = network.realname || 'kiwibnc';
         con.state.password = network.password;
         con.state.sasl.account = network.sasl_account || '';
         con.state.sasl.password = network.sasl_pass || '';
@@ -260,6 +338,34 @@ class ConnectionIncoming {
 
         this.destroy();
     }
+}
+
+// Split []tokens into batches that when joined with prefix and suffix, its length does not exceed maxLen
+// eg. ['one', 'two', ...100 more tokens] = [['one', 'two'], [...more tokens]]
+function batchIsupportTokensToMaxLenth(tokens, prefix, suffix='is supported by this server', maxLen=512) {
+    // 1 = the extra space after the prefix
+    let l = prefix.length + 1;
+    // 1 = the : before the suffix
+    l += suffix.length + 1;
+    // 2 = the \r\n at the end of the line
+    l += 2;
+
+    let tokenLines = [];
+    let currentLen = 0;
+
+    for (let i = 0; i < tokens.length; i++) {
+        let token = tokens[i];
+        // If this token goes over maxLen, start a new line. (Or if we don't have a line yet)
+        if (l + currentLen + token.length + 1 > maxLen || tokenLines.length === 0) {
+            tokenLines.push([]);
+            currentLen = 0;
+        }
+        tokenLines[tokenLines.length - 1].push(token);
+        // + 1 for the space after the token
+        currentLen += token.length + 1;
+    }
+
+    return tokenLines;
 }
 
 module.exports = ConnectionIncoming;
